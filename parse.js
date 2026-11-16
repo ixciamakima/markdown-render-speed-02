@@ -218,21 +218,43 @@ function trimCodeRaw(raw) {
 }
 
 // Link label normalisation: trim, collapse whitespace, full case fold.
-function normalizeLabel(label) {
-  return label.trim().replace(RE.multipleSpaceGlobal, ' ').toLowerCase().toUpperCase().toLowerCase();
+// Labels repeat heavily in generated documents, so results are cached on
+// the lexer context for the duration of one parse.
+function normalizeLabel(lx, label) {
+  const cache = lx.labelCache;
+  let out = cache.get(label);
+  if (out === undefined) {
+    out = label.trim().replace(RE.multipleSpaceGlobal, ' ').toLowerCase().toUpperCase().toLowerCase();
+    cache.set(label, out);
+  }
+  return out;
 }
 
 // Find where a bracket pair first goes negative; -1 when balanced or absent,
 // -2 when an opener is left unclosed. Backslash-escaped chars are skipped.
-function findClosing(text, pair) {
-  if (text.indexOf(pair[0]) === -1 && text.indexOf(pair[1]) === -1) return -1;
-  let depth = 0;
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === '\\') i++;
-    else if (text[i] === pair[0]) depth++;
-    else if (text[i] === pair[1] && (depth--, depth < 0)) return i;
+// Pure in its input, so results are cached per parse (hrefs repeat a lot).
+function findClosing(lx, text, pair) {
+  const cache = lx.closingCache;
+  const hit = cache.get(text);
+  if (hit !== undefined) return hit;
+  let out;
+  if (text.indexOf(pair[0]) === -1 && text.indexOf(pair[1]) === -1) {
+    out = -1;
+  } else {
+    let depth = 0;
+    out = -1;
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === '\\') i++;
+      else if (text[i] === pair[0]) depth++;
+      else if (text[i] === pair[1] && (depth--, depth < 0)) {
+        out = i;
+        break;
+      }
+    }
+    if (out === -1 && depth > 0) out = -2;
   }
-  return depth > 0 ? -2 : -1;
+  cache.set(text, out);
+  return out;
 }
 
 // Expand tabs to the next multiple-of-4 column, counting from `col`.
@@ -301,14 +323,21 @@ function topMask(lx) {
   return lx.maskStack[lx.maskStack.length - 1];
 }
 
+// The delimiter scan of a context is computed on first use: many contexts
+// (link labels, plain paragraphs) never attempt emphasis at all.
+function ensureScan(entry) {
+  if (entry.scan === null) entry.scan = scanDelims(entry.maskedSrc);
+  return entry.scan;
+}
+
 function lastEmStrongCloser(lx, masked, ch) {
   const top = topMask(lx);
-  return top && top.maskedSrc === masked ? top.emStrongCloser[ch] : scanDelims(masked).emStrongCloser[ch];
+  return top && top.maskedSrc === masked ? ensureScan(top).emStrongCloser[ch] : scanDelims(masked).emStrongCloser[ch];
 }
 
 function lastDelCloser(lx, masked) {
   const top = topMask(lx);
-  return top && top.maskedSrc === masked ? top.delCloser : scanDelims(masked).delCloser;
+  return top && top.maskedSrc === masked ? ensureScan(top).delCloser : scanDelims(masked).delCloser;
 }
 
 // Does this text contain a working link or reference link? Used to decide
@@ -322,7 +351,7 @@ function linkInText(lx, text) {
     const whole = m[0];
     const open = whole.lastIndexOf('[');
     const isImage = whole.charAt(0) === '!';
-    const known = Object.hasOwn(lx.links, normalizeLabel(whole.slice(open + 1, -1)));
+    const known = Object.hasOwn(lx.links, normalizeLabel(lx, whole.slice(open + 1, -1)));
     if (!isImage && known && !(open > 1 && linkInText(lx, whole.slice(1, open - 1)))) return true;
   }
   return false;
@@ -330,11 +359,13 @@ function linkInText(lx, text) {
 
 function maskInline(lx, src) {
   let masked = src;
-  if (src.includes('[')) {
+  // Each masking pass is skipped when the current text cannot contain
+  // anything the pass would rewrite (the pass is the identity then).
+  if (src.includes('[') && Object.keys(lx.links).length > 0) {
     const search = INL.reflinkSearch;
     const maskOne = (whole) => {
       const open = whole.lastIndexOf('[');
-      if (!Object.hasOwn(lx.links, normalizeLabel(whole.slice(open + 1, -1)))) return whole;
+      if (!Object.hasOwn(lx.links, normalizeLabel(lx, whole.slice(open + 1, -1)))) return whole;
       if (open > 1 && whole.charAt(0) !== '!') {
         const inner = whole.slice(1, open - 1);
         if (linkInText(lx, inner)) {
@@ -345,15 +376,19 @@ function maskInline(lx, src) {
     };
     masked = masked.replace(search, maskOne);
   }
-  masked = masked.replace(INL.anyPunctuationOutsideCode, (whole, codeRun, punct) => {
-    if (punct) return '+'.repeat(whole.length);
-    if (codeRun) return codeRun + whole.slice(codeRun.length, -codeRun.length).replace(/`/g, '+') + codeRun;
-    return whole;
-  });
-  masked = masked.replace(INL.blockSkip, (whole, g1, g2) => {
-    const keep = g2 ? g2.length : 0;
-    return whole.slice(0, keep) + '[' + 'a'.repeat(whole.length - keep - 2) + ']';
-  });
+  if (masked.includes('\\') || masked.includes('`')) {
+    masked = masked.replace(INL.anyPunctuationOutsideCode, (whole, codeRun, punct) => {
+      if (punct) return '+'.repeat(whole.length);
+      if (codeRun) return codeRun + whole.slice(codeRun.length, -codeRun.length).replace(/`/g, '+') + codeRun;
+      return whole;
+    });
+  }
+  if (masked.includes('[') || masked.includes('`') || masked.includes('<')) {
+    masked = masked.replace(INL.blockSkip, (whole, g1, g2) => {
+      const keep = g2 ? g2.length : 0;
+      return whole.slice(0, keep) + '[' + 'a'.repeat(whole.length - keep - 2) + ']';
+    });
+  }
   return masked;
 }
 
@@ -449,7 +484,7 @@ function linkToken(lx, src) {
     const unescaped = stripTail(hrefTrimmed.slice(0, -1), '\\');
     if ((hrefTrimmed.length - unescaped.length) % 2 === 0) return undefined;
   } else {
-    const close = findClosing(cap[2], '()');
+    const close = findClosing(lx, cap[2], '()');
     if (close === -2) return undefined;
     if (close > -1) {
       const total = (cap[0].indexOf('!') === 0 ? 5 : 4) + cap[1].length + close;
@@ -474,7 +509,7 @@ function reflinkToken(lx, src) {
   if ((cap = INL.reflink.exec(src)) || (cap = INL.nolink.exec(src))) {
     const labelOffset = cap[0].charAt(0) === '!' ? 2 : 1;
     if (labelSwallowsTag(src, cap[1], labelOffset)) return undefined;
-    const def = lx.links[normalizeLabel(cap[2] || cap[1])];
+    const def = lx.links[normalizeLabel(lx, cap[2] || cap[1])];
     if (!def) {
       const first = cap[0].charAt(0);
       return { type: 'text', raw: first, text: first };
@@ -495,14 +530,28 @@ function emStrongToken(lx, src, masked, prevChar) {
   const offset = masked.length - src.length;
   let runStart = offset;
   while (runStart > 0 && masked[runStart - 1] === delim) runStart--;
-  const beforeRun = [...masked.slice(Math.max(0, runStart - 2), runStart)].at(-1) ?? '';
+  let beforeRun = '';
+  if (runStart > 0) {
+    const u1 = masked.charCodeAt(runStart - 1);
+    beforeRun = u1 >= 0xDC00 && u1 <= 0xDFFF && runStart >= 2
+      && masked.charCodeAt(runStart - 2) >= 0xD800 && masked.charCodeAt(runStart - 2) <= 0xDBFF
+      ? masked.slice(runStart - 2, runStart)
+      : masked[runStart - 1];
+  }
   const beforeIsDelimOrPunct = beforeRun === '*' || beforeRun === '_' || !!INL.punctuation.exec(beforeRun);
   if (runStart < offset) prevChar = beforeRun;
   const prevIsPunct = runStart < offset ? beforeIsDelimOrPunct : !!INL.punctuation.exec(prevChar);
   if (cap[4] && prevChar.match(RE.unicodeAlphaNumeric)) return undefined;
   const punctPart = cap[1] || cap[3] || '';
   if (!punctPart || !prevChar || prevIsPunct) {
-    const openerLen = [...cap[0]].length - 1;
+    // Code points of the match minus one; the match is a delimiter run
+    // plus at most one trailing code point (a surrogate pair counts once).
+    let openerLen = cap[0].length - 1;
+    const lastUnit = cap[0].charCodeAt(cap[0].length - 1);
+    if (lastUnit >= 0xDC00 && lastUnit <= 0xDFFF && cap[0].length >= 2) {
+      const prevUnit = cap[0].charCodeAt(cap[0].length - 2);
+      if (prevUnit >= 0xD800 && prevUnit <= 0xDBFF) openerLen -= 1;
+    }
     let remaining = openerLen;
     let leftover = 0;
     const runTotal = offset - runStart + openerLen;
@@ -519,7 +568,7 @@ function emStrongToken(lx, src, masked, prevChar) {
     while ((hit = closerRe.exec(rest)) !== null && !(hit.index > limit)) {
       const run = hit[1] || hit[2] || hit[3] || hit[4] || hit[5] || hit[6];
       if (!run) continue;
-      let runLen = [...run].length;
+      let runLen = run.length;
       if (hit[3] || hit[4]) {
         remaining += runLen;
         continue;
@@ -534,7 +583,9 @@ function emStrongToken(lx, src, masked, prevChar) {
       remaining -= runLen;
       if (remaining > 0) continue;
       runLen = Math.min(runLen, runLen + remaining + leftover);
-      const firstCharLen = [...hit[0]][0].length;
+      const fc = hit[0].charCodeAt(0);
+      const firstCharLen = fc >= 0xD800 && fc <= 0xDBFF && hit[0].length > 1
+        && hit[0].charCodeAt(1) >= 0xDC00 && hit[0].charCodeAt(1) <= 0xDFFF ? 2 : 1;
       const raw = src.slice(0, openerLen + hit.index + firstCharLen + runLen);
       if (Math.min(openerLen, runLen) % 2) {
         const inner = raw.slice(1, -1);
@@ -569,7 +620,12 @@ function delToken(lx, src, masked, prevChar) {
   const cap = INL.delLDelim.exec(src);
   if (!cap) return undefined;
   if (!(cap[1] || '') || !prevChar || INL.punctuation.exec(prevChar)) {
-    const openerLen = [...cap[0]].length - 1;
+    let openerLen = cap[0].length - 1;
+    const lastUnit = cap[0].charCodeAt(cap[0].length - 1);
+    if (lastUnit >= 0xDC00 && lastUnit <= 0xDFFF && cap[0].length >= 2) {
+      const prevUnit = cap[0].charCodeAt(cap[0].length - 2);
+      if (prevUnit >= 0xD800 && prevUnit <= 0xDBFF) openerLen -= 1;
+    }
     let remaining = openerLen;
     const lastCloser = lastDelCloser(lx, masked);
     const scanFrom = masked.length - src.length + openerLen;
@@ -582,7 +638,7 @@ function delToken(lx, src, masked, prevChar) {
     while ((hit = closerRe.exec(rest)) !== null && !(hit.index > limit)) {
       const run = hit[1] || hit[2] || hit[3] || hit[4] || hit[5] || hit[6];
       if (!run) continue;
-      let runLen = [...run].length;
+      let runLen = run.length;
       if (runLen !== openerLen) continue;
       if (hit[3] || hit[4]) {
         remaining += runLen;
@@ -591,7 +647,9 @@ function delToken(lx, src, masked, prevChar) {
       remaining -= runLen;
       if (remaining > 0) continue;
       runLen = Math.min(runLen, runLen + remaining);
-      const firstCharLen = [...hit[0]][0].length;
+      const fc = hit[0].charCodeAt(0);
+      const firstCharLen = fc >= 0xD800 && fc <= 0xDBFF && hit[0].length > 1
+        && hit[0].charCodeAt(1) >= 0xDC00 && hit[0].charCodeAt(1) <= 0xDFFF ? 2 : 1;
       const raw = src.slice(0, openerLen + hit.index + firstCharLen + runLen);
       const inner = raw.slice(openerLen, -openerLen);
       return { type: 'del', raw, text: inner, tokens: inlineTokens(lx, inner) };
@@ -756,6 +814,11 @@ function blockquoteToken(lx, src) {
   return { type: 'blockquote', raw: rawAll, tokens, text: textAll };
 }
 
+function firstLineOf(s) {
+  const nl = s.indexOf('\n');
+  return nl === -1 ? s : s.slice(0, nl);
+}
+
 // Lists: items are gathered line by line using indent-scoped starter
 // patterns; an item keeps consuming lines while they are indented to its
 // content column, are blank, or form a lazy paragraph continuation.
@@ -785,10 +848,12 @@ function listToken(lx, src) {
     if (!cap || BLK.hr.test(rest)) break;
     const itemStart = used();
     rest = rest.substring(cap[0].length);
-    const firstLineRaw = cap[2].split('\n', 1)[0];
+    const firstLineRaw = firstLineOf(cap[2]);
     const bulletWidth = cap[1].length;
-    let firstLine = firstLineRaw.replace(RE.leadingSpaceTab, (ws) => expandTabs(ws, bulletWidth));
-    let nextLine = rest.split('\n', 1)[0];
+    let firstLine = firstLineRaw.includes('\t')
+      ? firstLineRaw.replace(RE.leadingSpaceTab, (ws) => expandTabs(ws, bulletWidth))
+      : firstLineRaw;
+    let nextLine = firstLineOf(rest);
     const firstBlank = !firstLine.trim();
     let indent = 0;
     if (firstBlank) {
@@ -810,18 +875,29 @@ function listToken(lx, src) {
       const headingRe = headingBeginRe(indent);
       const htmlRe = htmlBeginRe(indent);
       const quoteRe = blockquoteBeginRe(indent);
+      const beginWidth = Math.max(0, Math.min(3, indent - 1));
       let prevLine = firstLine;
       let prevBlank = firstBlank;
       while (rest) {
-        const line = rest.split('\n', 1)[0];
+        const line = firstLineOf(rest);
         nextLine = line;
-        const expanded = line.replace(RE.leadingSpaceTab, (ws) => expandTabs(ws));
-        if (fencesRe.test(line) || headingRe.test(line) || htmlRe.test(line) || quoteRe.test(line) || nextBullet.test(line) || hrRe.test(line)) break;
+        const expanded = line.includes('\t')
+          ? line.replace(RE.leadingSpaceTab, (ws) => expandTabs(ws))
+          : line;
+        // Every begin pattern needs at most beginWidth spaces followed by
+        // one of ` ~ # < > * + - _ or a digit; anything else cannot break.
+        let si = 0;
+        while (line.charCodeAt(si) === 32) si++;
+        const sc = line.charCodeAt(si);
+        const mayBegin = si <= beginWidth && (sc === 96 || sc === 126 || sc === 35 || sc === 60 || sc === 62
+          || sc === 42 || sc === 43 || sc === 45 || sc === 95 || (sc >= 48 && sc <= 57));
+        if (mayBegin && (fencesRe.test(line) || headingRe.test(line) || htmlRe.test(line) || quoteRe.test(line) || nextBullet.test(line) || hrRe.test(line))) break;
         if (expanded.search(RE.nonSpaceChar) >= indent || !line.trim()) {
           content += '\n' + expanded.slice(indent);
         } else {
+          const prevDepth = (prevLine.includes('\t') ? prevLine.replace(/\t/g, '    ') : prevLine).search(RE.nonSpaceChar);
           if (prevBlank
-            || prevLine.replace(/\t/g, '    ').search(RE.nonSpaceChar) >= 4
+            || prevDepth >= 4
             || fencesRe.test(prevLine) || headingRe.test(prevLine) || htmlRe.test(prevLine) || hrRe.test(prevLine)) break;
           const lazy = /^ {0,3}(?:=+|-+) *$/.test(line) && BLK.lheading.test(prevLine + '\n' + line)
             ? '    ' + expanded.replace(/^ {0,3}/, '')
@@ -915,13 +991,13 @@ function htmlToken(src) {
   };
 }
 
-function defToken(src) {
+function defToken(lx, src) {
   const cap = BLK.def.exec(src);
   if (!cap) return undefined;
-  if (!RE.startAngleBracket.test(cap[2]) && findClosing(cap[2], '()') !== -1) return undefined;
+  if (!RE.startAngleBracket.test(cap[2]) && findClosing(lx, cap[2], '()') !== -1) return undefined;
   return {
     type: 'def',
-    tag: normalizeLabel(cap[1]),
+    tag: normalizeLabel(lx, cap[1]),
     raw: stripTail(cap[0], '\n'),
     href: cap[2] ? cap[2].replace(RE.hrefBrackets, '$1').replace(INL.anyPunctuation, '$1') : '',
     title: cap[3] ? cap[3].substring(1, cap[3].length - 1).replace(INL.anyPunctuation, '$1') : cap[3],
@@ -929,6 +1005,13 @@ function defToken(src) {
 }
 
 function tableToken(lx, src) {
+  // The delimiter row is the second line and must contain a dash plus a
+  // pipe or colon; anything else cannot be a table.
+  const nl = src.indexOf('\n');
+  if (nl === -1) return undefined;
+  const nl2 = src.indexOf('\n', nl + 1);
+  const line2 = nl2 === -1 ? src.slice(nl + 1) : src.slice(nl + 1, nl2);
+  if (!line2.includes('-') || (!line2.includes('|') && !line2.includes(':'))) return undefined;
   const cap = BLK.table.exec(src);
   if (!cap || !RE.tableDelimiter.test(cap[2])) return undefined;
   const headerCells = splitRow(cap[1]);
@@ -959,6 +1042,18 @@ function tableToken(lx, src) {
 }
 
 function lheadingToken(lx, src) {
+  // A setext heading needs a later line starting (after at most three
+  // spaces) with = or -; without one the pattern cannot match.
+  let setext = false;
+  for (let nl = src.indexOf('\n'); nl !== -1; nl = src.indexOf('\n', nl + 1)) {
+    let j = nl + 1;
+    while (src.charCodeAt(j) === 32) j++;
+    if (j - nl - 1 <= 3 && (src.charCodeAt(j) === 61 || src.charCodeAt(j) === 45)) {
+      setext = true;
+      break;
+    }
+  }
+  if (!setext) return undefined;
   const cap = BLK.lheading.exec(src);
   if (!cap) return undefined;
   const text = cap[1].trim();
@@ -1054,7 +1149,7 @@ function blockTokens(lx, src, tokens = [], inQuote = false) {
       tokens.push(tok);
       continue;
     }
-    if ((tok = defToken(rest))) {
+    if ((tok = defToken(lx, rest))) {
       rest = rest.substring(tok.raw.length);
       const prev = tokens[tokens.length - 1];
       if (prev?.type === 'paragraph' || prev?.type === 'text') {
@@ -1120,7 +1215,7 @@ function inlineTokens(lx, src, tokens = []) {
 function tokenizeInline(lx, src, tokens) {
   let masked = src;
   if (src.includes('*') || src.includes('_') || src.includes('~')) masked = maskInline(lx, src);
-  lx.maskStack.push(scanDelims(masked));
+  lx.maskStack.push({ maskedSrc: masked, scan: null });
   try {
     let rest = src;
     let prevChar = '';
@@ -1132,22 +1227,29 @@ function tokenizeInline(lx, src, tokens) {
       if (!lastWasText) prevChar = '';
       lastWasText = false;
       let tok;
-      if ((tok = escapeToken(rest))) {
+      // First-character dispatch: each tokenizer's pattern can only match
+      // at the start characters its bucket lists (escapes need a backslash,
+      // emphasis a * or _, and so on), so skipping the others cannot change
+      // which token wins; the relative order inside a bucket is the
+      // reference's order.
+      const c = rest.charCodeAt(0);
+      const bracket = c === 91 || (c === 33 && rest.charCodeAt(1) === 91);
+      if (c === 92 && (tok = escapeToken(rest))) {
         rest = rest.substring(tok.raw.length);
         tokens.push(tok);
         continue;
       }
-      if ((tok = tagToken(lx, rest))) {
+      if (c === 60 && (tok = tagToken(lx, rest))) {
         rest = rest.substring(tok.raw.length);
         tokens.push(tok);
         continue;
       }
-      if ((tok = linkToken(lx, rest))) {
+      if (bracket && (tok = linkToken(lx, rest))) {
         rest = rest.substring(tok.raw.length);
         tokens.push(tok);
         continue;
       }
-      if ((tok = reflinkToken(lx, rest))) {
+      if (bracket && (tok = reflinkToken(lx, rest))) {
         rest = rest.substring(tok.raw.length);
         const prev = tokens[tokens.length - 1];
         if (tok.type === 'text' && prev?.type === 'text') {
@@ -1156,32 +1258,34 @@ function tokenizeInline(lx, src, tokens) {
         } else tokens.push(tok);
         continue;
       }
-      if ((tok = emStrongToken(lx, rest, masked, prevChar))) {
+      if ((c === 42 || c === 95) && (tok = emStrongToken(lx, rest, masked, prevChar))) {
         rest = rest.substring(tok.raw.length);
         tokens.push(tok);
         continue;
       }
-      if ((tok = codespanToken(rest))) {
+      if (c === 96 && (tok = codespanToken(rest))) {
         rest = rest.substring(tok.raw.length);
         tokens.push(tok);
         continue;
       }
-      if ((tok = brToken(rest))) {
+      if ((c === 32 || c === 92) && (tok = brToken(rest))) {
         rest = rest.substring(tok.raw.length);
         tokens.push(tok);
         continue;
       }
-      if ((tok = delToken(lx, rest, masked, prevChar))) {
+      if (c === 126 && (tok = delToken(lx, rest, masked, prevChar))) {
         rest = rest.substring(tok.raw.length);
         tokens.push(tok);
         continue;
       }
-      if ((tok = autolinkToken(rest))) {
+      if (c === 60 && (tok = autolinkToken(rest))) {
         rest = rest.substring(tok.raw.length);
         tokens.push(tok);
         continue;
       }
-      if (!lx.state.inLink && (tok = urlToken(rest))) {
+      if (!lx.state.inLink
+        && ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 43 || c === 45)
+        && (tok = urlToken(rest))) {
         rest = rest.substring(tok.raw.length);
         tokens.push(tok);
         continue;
@@ -1366,6 +1470,8 @@ function renderInline(tokens, plain = false) {
 export function parse(markdown) {
   const lx = {
     links: Object.create(null),
+    labelCache: new Map(),
+    closingCache: new Map(),
     queue: [],
     maskStack: [],
     state: { inLink: false, inRawBlock: false, linkEmitted: false, linkParenPossible: true, top: true },
